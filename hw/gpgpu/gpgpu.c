@@ -333,8 +333,6 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
          * 写任意值触发内核执行，硬件手册 §8.2
          * 触发条件：设备已使能 && 不忙 && Grid/Block 维度均 > 0 && 地址有效
          * 若条件不满足，设置 INVALID_CMD 错误
-         *
-         * TODO 实验八：在此实现执行引擎调用（gpgpu_core_exec_kernel）
          */
         if (!(s->global_ctrl & GPGPU_CTRL_ENABLE)) {
             /* 设备未使能，写 DISPATCH 无效 */
@@ -347,8 +345,20 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                    !s->kernel.block_dim[1] || !s->kernel.block_dim[2]) {
             /* Grid/Block 维度为 0，写 DISPATCH 无效 */
             s->error_status |= GPGPU_ERR_INVALID_CMD;
+        } else {
+            /* 启动内核执行引擎 */
+            s->global_status |= GPGPU_STATUS_BUSY;
+            int ret = gpgpu_core_exec_kernel(s);
+            s->global_status &= ~GPGPU_STATUS_BUSY;
+            if (ret != 0) {
+                s->global_status |= GPGPU_STATUS_ERROR;
+            }
+            s->global_status |= GPGPU_STATUS_READY;
+            /* 触发内核完成中断（如果已使能） */
+            if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+                s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+            }
         }
-        /* else: TODO 实验八中启动执行引擎 */
         break;
 
     /* ---- DMA 引擎寄存器 ---- */
@@ -380,10 +390,27 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
 
     case GPGPU_REG_DMA_CTRL:
         s->dma.ctrl = (uint32_t)val;
-        /*
-         * TODO 实验六：实现 DMA 传输逻辑
-         * 当 START 位（bit 0）被置 1 时，启动 DMA 传输
-         */
+        if (val & GPGPU_DMA_START) {
+            uint64_t src  = s->dma.src_addr;
+            uint64_t dst  = s->dma.dst_addr;
+            uint32_t sz   = s->dma.size;
+
+            s->dma.status = GPGPU_DMA_BUSY;
+            /* VRAM 内部搬运 */
+            if (src + sz <= s->vram_size && dst + sz <= s->vram_size && sz > 0) {
+                memmove(s->vram_ptr + dst, s->vram_ptr + src, sz);
+                s->dma.status = GPGPU_DMA_COMPLETE;
+                if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
+                    s->irq_status |= GPGPU_IRQ_DMA_DONE;
+                }
+            } else {
+                s->dma.status = GPGPU_DMA_ERROR;
+                s->error_status |= GPGPU_ERR_DMA_FAULT;
+                if (s->irq_enable & GPGPU_IRQ_ERROR) {
+                    s->irq_status |= GPGPU_IRQ_ERROR;
+                }
+            }
+        }
         break;
 
     case GPGPU_REG_DMA_STATUS:
@@ -425,10 +452,15 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
 
     /* ---- 同步寄存器 ---- */
     case GPGPU_REG_BARRIER:
-        /*
-         * 写任意值发出 Barrier 信号
-         * TODO 实验七：实现 Barrier 同步逻辑
-         */
+        /* 写任意值发出 Barrier 信号：计数加一，达到 target 时重置 */
+        s->simt.barrier_count++;
+        if (s->simt.barrier_target > 0 &&
+            s->simt.barrier_count >= s->simt.barrier_target) {
+            s->simt.barrier_count = 0;
+            s->simt.barrier_active = false;
+        } else {
+            s->simt.barrier_active = true;
+        }
         break;
 
     case GPGPU_REG_THREAD_MASK:
@@ -543,16 +575,23 @@ static const MemoryRegionOps gpgpu_doorbell_ops = {
     },
 };
 
-/* TODO: Implement DMA completion handler */
 static void gpgpu_dma_complete(void *opaque)
 {
-    (void)opaque;
+    GPGPUState *s = opaque;
+    s->dma.status = GPGPU_DMA_COMPLETE;
+    if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
+        s->irq_status |= GPGPU_IRQ_DMA_DONE;
+    }
 }
 
-/* TODO: Implement kernel completion handler */
 static void gpgpu_kernel_complete(void *opaque)
 {
-    (void)opaque;
+    GPGPUState *s = opaque;
+    s->global_status &= ~GPGPU_STATUS_BUSY;
+    s->global_status |= GPGPU_STATUS_READY;
+    if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+        s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+    }
 }
 
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)
